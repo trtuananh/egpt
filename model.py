@@ -328,3 +328,188 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+# EGPT Language Model
+class Encoder(GPT):
+
+    @classmethod
+    def create(cls, config, checkpoint_path):
+        block_size = config.block_size
+        n_embd = config.n_embd
+        n_head = config.n_head
+        n_layer = config.n_layer
+        dropout = config.dropout
+        model = cls(vocab_size, block_size, n_embd, n_head, n_layer, dropout)
+        model = model.to(device)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        print("encoder checkpoint: ", checkpoint['best_eval_loss'])
+        model.load_state_dict(checkpoint['model_state_dict'])
+        return model
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return x, loss # return x (embeddings) instead of logits for the encoder
+
+class EGPT(nn.Module):
+
+    def __init__(self, config, encoder: Encoder):
+        super().__init__()
+        self.encoder = encoder
+        self.encoder.eval()
+        # Freeze encoder parameters
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+        # each token directly reads off the logits for the next token from a lookup table
+        self.ffwd = MLP(config)
+        self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
+        encoder_block_size = config.encoder_config.block_size
+        self.length_embedding_table = nn.Embedding(encoder_block_size, config.n_embd)
+
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = LayerNorm(config.n_embd, bias=config.bias) # final layer norm
+        self.lm_head = self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.register_buffer("block_size", torch.tensor(config.block_size))
+
+        # better init, not covered in the original GPT video, but important, will cover in followup video
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+        self.pre_emb = None # cache for previous embeddings
+
+    def _is_encoder_module(self, module):
+        """Kiểm tra module có thuộc encoder không"""
+        for encoder_module in self.encoder.modules():
+            if module is encoder_module:
+                return True
+        return False
+
+    def _init_weights(self, module):
+        # Bỏ qua encoder modules
+        if self._is_encoder_module(module):
+            return
+            
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    @classmethod
+    def create(cls, config):
+        block_size = config.block_size
+        n_embd = config.n_embd
+        n_head = config.n_head
+        n_layer = config.n_layer
+        dropout = config.dropout
+        encoder = Encoder.create(config.encoder_conf, config.encoder_checkpoint)
+        print(type(encoder))
+        model = cls(vocab_size, block_size, n_embd, n_head, n_layer, encoder, dropout)
+        return model
+
+    @torch.no_grad()
+    def encode(self, idx, targets=None):
+        return self.encoder(idx, targets)
+
+    def _forward_block(self, emb, targets=None):
+        device = emb.device
+        B, T, N, C = emb.shape
+        pos = torch.arange(N, device=device)
+        lens = torch.arange(T, device=device)
+
+        x = self.ffwd(emb)
+        pos_emb = self.position_embedding_table(pos) # (N,C)
+        len_emb = self.length_embedding_table(lens) # (T,C)
+        x = x + pos_emb # (B,T,N,C)
+        x[:, :, :-1, :] += len_emb[-1] # (B,T,N-1,C) + (C)
+        x[:, :, -1, :] += len_emb      # (B,T,C) + (T,C)
+        x = self.blocks(x) # (B,T,N,C)
+        x = self.ln_f(x[:, :, -1, :]) # (B,T,C)
+        logits = self.lm_head(x) # (B,T,vocab_size)
+        logits = self.lm_head(emb[:, :, -1, :])
+
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.reshape(B*T, C)
+            targets = targets.reshape(B*T)
+            loss = F.cross_entropy(logits, targets)
+
+        return logits, loss
+        
+    def forward(self, idx, targets=None, is_init=False):
+        B, T = idx.shape
+        encoder_block_size = self.encoder.position_embedding_table.weight.shape[0]
+        N = math.ceil(T / encoder_block_size)
+
+        # encode the previous blocks
+        pre_idx = idx[:, :(N-1)*encoder_block_size]
+        pre_idx = pre_idx.reshape(B, N - 1, encoder_block_size) # (B, N - 1, T)
+        pre_emb, _ = self.encode(pre_idx) # (B, N - 1, T, C)
+        B, pre_N, encoder_T, C = pre_emb.shape
+        # reshape and expand to concatenate with current block
+        pre_emb = pre_emb[:, :, -1, :] # (B, N - 1, C)
+        if not is_init and self.pre_emb is not None:
+            pre_emb = torch.cat((self.pre_emb, pre_emb), dim=-2) # (B, N - 1, C)
+        self.pre_emb = pre_emb
+        pre_emb = pre_emb.reshape(B, 1, pre_N, C) # (B, 1, N - 1, C)
+
+        # encode the final block
+        cur_idx = idx[:, (N-1)*encoder_block_size:] # (B, T)
+        cur_emb, _ = self.encode(cur_idx) # (B, T, C)
+        B, T, C = cur_emb.shape
+        cur_emb = cur_emb.reshape(B, T, 1, C) # (B, T, 1, C)
+
+        # concatnate to get final embedding
+        pre_emb = pre_emb.expand(B, T, pre_N, C) # (B, T, N - 1, C)
+        emb = torch.cat((pre_emb, cur_emb), dim=-2) # (B, T, N, C)
+        if targets is not None:
+            targets = targets[:, -T:]
+
+        logits, loss = self._forward_block(emb, targets)  # (B*T, vocab_size)
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens):
+        # idx is (B, T) array of indices in the current context
+        for _ in range(max_new_tokens):
+            # crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]
+            # get the predictions
+            logits, loss = self(idx_cond)
+            # focus only on the last time step
+            logits = logits[:, -1, :] # becomes (B, C)
+            # apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1) # (B, C)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            # append sampled index to the running sequence
+            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+        return idx
