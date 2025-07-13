@@ -1,3 +1,5 @@
+from .base_config import *
+
 # evaluate the base gpt2
 n_layer=12, 
 n_head=12, 

@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import os
 import inspect
+import typing as tp
 from dataclasses import dataclass
 
 import torch
@@ -106,8 +107,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-@dataclass
-class GPTConfig:
+class GPTConfig(tp.NamedTuple):
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -393,8 +393,7 @@ class GPT(nn.Module):
 
 
 # EGPT Language Model
-@dataclass
-class EGPTConfig:
+class EGPTConfig(tp.NamedTuple):
     encoder_config: GPTConfig = GPTConfig()
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
@@ -500,7 +499,7 @@ class EGPT(nn.Module):
         device = config.device
         encoder_config = GPTConfig(
             block_size=config.encoder_config.block_size,
-            vocab_size=config.encoder_config.vocab_size,
+            # vocab_size=config.encoder_config.vocab_size,
             n_layer=config.encoder_config.n_layer,
             n_head=config.encoder_config.n_head,
             n_embd=config.encoder_config.n_embd,
@@ -562,16 +561,19 @@ class EGPT(nn.Module):
         x = x + pos_emb # (B,T,N,C)
         x[:, :, :-1, :] += len_emb[-1] # (B,T,N-1,C) + (C)
         x[:, :, -1, :] += len_emb      # (B,T,C) + (T,C)
-        x = self.blocks(x) # (B,T,N,C)
-        x = self.ln_f(x[:, :, -1, :]) # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
-        logits = self.lm_head(emb[:, :, -1, :])
+        x = x.reshape(B*T, N, C) # (B*T,N,C)
+        for block in self.blocks:
+            x = block(x) # (B*T,N,C)
+
+        # final layer norm and lm head
+        x = self.ln_f(x[:, -1, :]) # (B*T,C)
+        logits = self.lm_head(x) # (B*T,vocab_size)
 
         if targets is None:
             loss = None
         else:
-            B, T, C = logits.shape
-            logits = logits.reshape(B*T, C)
+            # B, T, C = logits.shape
+            logits = logits.reshape(B*T, -1) # (B*T,vocab_size)
             targets = targets.reshape(B*T)
             loss = F.cross_entropy(logits, targets)
 
@@ -579,20 +581,21 @@ class EGPT(nn.Module):
         
     def forward(self, idx, targets=None, is_init=False):
         B, T = idx.shape
-        encoder_block_size = self.encoder.position_embedding_table.weight.shape[0]
+        encoder_block_size = self.config.encoder_config.block_size
         N = math.ceil(T / encoder_block_size)
 
         # encode the previous blocks
-        pre_idx = idx[:, :(N-1)*encoder_block_size]
-        pre_idx = pre_idx.reshape(B, N - 1, encoder_block_size) # (B, N - 1, T)
-        pre_emb, _ = self.encode(pre_idx) # (B, N - 1, T, C)
-        B, pre_N, encoder_T, C = pre_emb.shape
+        pre_idx = idx[:, :(N-1)*encoder_block_size] # (B, (N-1)*T)
+        # pre_idx = pre_idx.reshape(B, N - 1, encoder_block_size) # (B, N - 1, T)
+        pre_emb, _ = self.encode(pre_idx) # (B, (N-1)*T, C)
         # reshape and expand to concatenate with current block
-        pre_emb = pre_emb[:, :, -1, :] # (B, N - 1, C)
+        pre_emb = pre_emb[:, encoder_block_size-1::encoder_block_size, :] # (B, N - 1, C)
         if not is_init and self.pre_emb is not None:
             pre_emb = torch.cat((self.pre_emb, pre_emb), dim=-2) # (B, N - 1, C)
         self.pre_emb = pre_emb
+        B, pre_N, C = pre_emb.shape
         pre_emb = pre_emb.reshape(B, 1, pre_N, C) # (B, 1, N - 1, C)
+        pre_emb = pre_emb.expand(B, T, pre_N, C) # (B, T, N - 1, C)
 
         # encode the final block
         cur_idx = idx[:, (N-1)*encoder_block_size:] # (B, T)
@@ -601,7 +604,7 @@ class EGPT(nn.Module):
         cur_emb = cur_emb.reshape(B, T, 1, C) # (B, T, 1, C)
 
         # concatnate to get final embedding
-        pre_emb = pre_emb.expand(B, T, pre_N, C) # (B, T, N - 1, C)
+        # pre_emb = pre_emb.expand(B, T, pre_N, C) # (B, T, N - 1, C)
         emb = torch.cat((pre_emb, cur_emb), dim=-2) # (B, T, N, C)
         if targets is not None:
             targets = targets[:, -T:]
@@ -634,3 +637,19 @@ class EGPT(nn.Module):
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0/dt) # per second
+        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = flops_achieved / flops_promised
+        return mfu
