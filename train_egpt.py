@@ -68,6 +68,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 encoder_block_size = encoder_config.block_size
 context_size = block_size * encoder_block_size
+print(f"Using context size: {context_size} (block size: {block_size}, encoder block size: {encoder_block_size})")
 def get_batch(split, block_size=context_size):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -128,15 +129,15 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters*encoder_block_size, device=device)
+        losses = torch.zeros(eval_iters*block_size, device=device)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             for block_idx in range(block_size):
                 with ctx:
-                    block_X = X[:, block_idx * encoder_block_size:(block_idx+1) * encoder_block_size]
-                    block_Y = Y[:, block_idx * encoder_block_size:(block_idx+1) * encoder_block_size]
-                    logits, loss = model(block_X, block_Y, is_init=block_idx == 0)
-                losses[k*encoder_block_size + block_idx] = loss.item()
+                    block_X = X[:, block_idx * encoder_block_size:(block_idx + 1) * encoder_block_size]
+                    block_Y = Y[:, block_idx * encoder_block_size:(block_idx + 1) * encoder_block_size]
+                    _, loss = model(block_X, targets=block_Y, is_init=block_idx == 0)
+                    losses[k * block_size + block_idx] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
