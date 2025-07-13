@@ -8,6 +8,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
+import os
 import inspect
 from dataclasses import dataclass
 
@@ -229,7 +230,7 @@ class GPT(nn.Module):
             config_args['dropout'] = override_args['dropout']
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-        model = GPT(config)
+        model = cls(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
@@ -258,6 +259,67 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
 
+        return model
+
+    @classmethod
+    def create(cls, config, meta_vocab_size=None):
+        out_dir = config.out_dir
+        init_from = config.init_from
+        n_layer = config.n_layer
+        n_head = config.n_head
+        n_embd = config.n_embd
+        block_size = config.block_size
+        dropout = config.dropout
+        bias = config.bias
+        device = config.device
+
+        model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+        if init_from == 'scratch':
+            # init a new model from scratch
+            print("Initializing a new model from scratch")
+            # determine the vocab size we'll use for from-scratch training
+            if meta_vocab_size is None:
+                print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+            model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+            gptconf = GPTConfig(**model_args)
+            model = cls(gptconf)
+        elif init_from == 'resume':
+            print(f"Resuming training from {out_dir}")
+            # resume training from a checkpoint.
+            ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            checkpoint_model_args = checkpoint['model_args']
+            # force these config attributes to be equal otherwise we can't even resume training
+            # the rest of the attributes (e.g. dropout) can stay as desired from command line
+            for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+                model_args[k] = checkpoint_model_args[k]
+            # create the model
+            gptconf = GPTConfig(**model_args)
+            model = cls(gptconf)
+            state_dict = checkpoint['model']
+            # fix the keys of the state dictionary :(
+            # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+            unwanted_prefix = '_orig_mod.'
+            for k,v in list(state_dict.items()):
+                if k.startswith(unwanted_prefix):
+                    state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+            model.load_state_dict(state_dict)
+            iter_num = checkpoint['iter_num']
+            best_val_loss = checkpoint['best_val_loss']
+        elif init_from.startswith('gpt2'):
+            print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+            # initialize from OpenAI GPT-2 weights
+            override_args = dict(dropout=dropout)
+            model = cls.from_pretrained(init_from, override_args)
+            # read off the created config params, so we can store them into checkpoint correctly
+            for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+                model_args[k] = getattr(model.config, k)
+        # crop down the model block size if desired, using model surgery
+        if block_size < model.config.block_size:
+            model.crop_block_size(block_size)
+            model_args['block_size'] = block_size # so that the checkpoint will have the right value
+        model.to(device)
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
@@ -331,22 +393,21 @@ class GPT(nn.Module):
 
 
 # EGPT Language Model
+@dataclass
+class EGPTConfig:
+    encoder_config: GPTConfig = GPTConfig()
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
 class Encoder(GPT):
-
-    @classmethod
-    def create(cls, config, checkpoint_path):
-        block_size = config.block_size
-        n_embd = config.n_embd
-        n_head = config.n_head
-        n_layer = config.n_layer
-        dropout = config.dropout
-        model = cls(vocab_size, block_size, n_embd, n_head, n_layer, dropout)
-        model = model.to(device)
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        print("encoder checkpoint: ", checkpoint['best_eval_loss'])
-        model.load_state_dict(checkpoint['model_state_dict'])
-        return model
-
+    """ Encoder class that uses the GPT architecture to encode input sequences.
+    It is designed to be used as a frozen encoder in the EGPT model.
+    It does not include the final language model head, and instead returns the embeddings."""
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
@@ -374,9 +435,13 @@ class Encoder(GPT):
 
 class EGPT(nn.Module):
 
-    def __init__(self, config, encoder: Encoder):
+    def __init__(self, config: EGPTConfig, encoder: Encoder = None):
         super().__init__()
-        self.encoder = encoder
+        self.config = config
+        if encoder is None:
+            encoder = Encoder(config=config.encoder_config)
+        else:
+            self.encoder = encoder
         self.encoder.eval()
         # Freeze encoder parameters
         for param in self.encoder.parameters():
@@ -422,16 +487,64 @@ class EGPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     @classmethod
-    def create(cls, config):
-        block_size = config.block_size
-        n_embd = config.n_embd
-        n_head = config.n_head
+    def create(cls, config, meta_vocab_size=None):
+        print("================ Creating EGPT model ================")
+        out_dir = config.out_dir
+        init_from = config.init_from
         n_layer = config.n_layer
+        n_head = config.n_head
+        n_embd = config.n_embd
+        block_size = config.block_size
         dropout = config.dropout
-        encoder = Encoder.create(config.encoder_conf, config.encoder_checkpoint)
-        print(type(encoder))
-        model = cls(vocab_size, block_size, n_embd, n_head, n_layer, encoder, dropout)
-        return model
+        bias = config.bias
+        device = config.device
+        encoder_config = GPTConfig(
+            block_size=config.encoder_config.block_size,
+            vocab_size=config.encoder_config.vocab_size,
+            n_layer=config.encoder_config.n_layer,
+            n_head=config.encoder_config.n_head,
+            n_embd=config.encoder_config.n_embd,
+            dropout=config.encoder_config.dropout,
+            bias=config.encoder_config.bias
+        )
+
+        model_args = dict(encoder_config=encoder_config, n_layer=n_layer, n_head=n_head, 
+                          n_embd=n_embd, block_size=block_size,
+                          bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+        if init_from == 'scratch':
+            # init a new model from scratch
+            print("Initializing a new model from scratch")
+            # determine the vocab size we'll use for from-scratch training
+            if meta_vocab_size is None:
+                print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+            model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+            gptconf = EGPTConfig(**model_args)
+            encoder = Encoder.create(config.encoder_config, meta_vocab_size=meta_vocab_size)
+            checkpoint = None
+            model = cls(gptconf, encoder=encoder)
+        elif init_from == 'resume':
+            print(f"Resuming training from {out_dir}")
+            # resume training from a checkpoint.
+            ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            checkpoint_model_args = checkpoint['model_args']
+            # force these config attributes to be equal otherwise we can't even resume training
+            # the rest of the attributes (e.g. dropout) can stay as desired from command line
+            for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+                model_args[k] = checkpoint_model_args[k]
+            # create the model
+            gptconf = EGPTConfig(**model_args)
+            model = cls(gptconf)
+            state_dict = checkpoint['model']
+            # fix the keys of the state dictionary :(
+            # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+            unwanted_prefix = '_orig_mod.'
+            for k,v in list(state_dict.items()):
+                if k.startswith(unwanted_prefix):
+                    state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+            model.load_state_dict(state_dict)
+        model.to(device)
+        return model, checkpoint, model_args
 
     @torch.no_grad()
     def encode(self, idx, targets=None):
@@ -496,20 +609,28 @@ class EGPT(nn.Module):
         logits, loss = self._forward_block(emb, targets)  # (B*T, vocab_size)
         return logits, loss
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        # idx is (B, T) array of indices in the current context
-        for _ in range(max_new_tokens):
-            # crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
-            # get the predictions
-            logits, loss = self(idx_cond)
-            # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, C)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-            # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-        return idx
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
