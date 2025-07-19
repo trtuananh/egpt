@@ -23,7 +23,7 @@ block_size = 16
 gradient_accumulation_steps = block_size
 
 # this makes total number of tokens be 300B
-resume_optimizer = True # if True, reset the optimizer state when resuming training
+resume_optimizer = True # if True, resume the optimizer state when training
 learning_rate = 6e-4 # max learning rate
 max_iters = 6000
 warmup_iters = 20 # how many steps to warm up for
