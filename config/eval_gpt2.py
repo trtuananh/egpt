@@ -1,8 +1,8 @@
 from .base_config import *
 
 # evaluate the base gpt2
-n_layer=12, 
-n_head=12, 
+n_layer=12
+n_head=12
 n_embd=768
 # 124M parameters
 batch_size = 8

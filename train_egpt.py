@@ -15,6 +15,25 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
+import ctypes
+import atexit
+
+# Set thread execution state to prevent system from sleeping
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_AWAYMODE_REQUIRED = 0x00000040  # Optional, useful for media apps
+
+def prevent_sleep():
+    ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+    )
+
+def allow_sleep():
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+# Đảm bảo máy không sleep trong quá trình chạy
+prevent_sleep()
+
 
 import os
 import time
@@ -106,7 +125,8 @@ optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta
 if init_from == 'resume':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    if resume_optimizer:
+        optimizer.load_state_dict(checkpoint['optimizer'])
 else:
     # if not resuming, we need to set the iter_num and best_val_loss
     iter_num = 0
@@ -186,19 +206,20 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
+
+        is_best = losses['val'] < best_val_loss
+        checkpoint = {
+            'model': raw_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'model_args': model_args,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
+            'config': config.config_dict,  # save the config dict
+        }
+        if is_best:
             best_val_loss = losses['val']
-            checkpoint = {
-                'model': raw_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_args': model_args,
-                'iter_num': iter_num,
-                'best_val_loss': best_val_loss,
-                'config': config.config_dict,  # save the config dict
-            }
             print(f"saving best checkpoint to {out_dir}, best_val_loss = {best_val_loss:.4f}")
             torch.save(checkpoint, os.path.join(out_dir, 'best_ckpt.pt'))
-            torch.save(checkpoint, os.path.join(out_dir, 'last_ckpt.pt'))
             
         if iter_num > 0 and always_save_checkpoint:
             # save a checkpoint every eval_interval iterations
@@ -248,7 +269,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, lr {lr:.6f}, grad_norm {torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip):.4f}, ")
     iter_num += 1
     local_iter_num += 1
 
@@ -258,3 +279,7 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+
+# Khi chương trình kết thúc, cho phép sleep lại
+atexit.register(allow_sleep)

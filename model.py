@@ -146,7 +146,7 @@ class GPT(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        print("number of parameters of GPT: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -424,7 +424,7 @@ class Encoder(GPT):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -438,7 +438,7 @@ class EGPT(nn.Module):
         super().__init__()
         self.config = config
         if encoder is None:
-            encoder = Encoder(config=config.encoder_config)
+            self.encoder = Encoder(config=config.encoder_config)
         else:
             self.encoder = encoder
         self.encoder.eval()
@@ -460,11 +460,14 @@ class EGPT(nn.Module):
         # better init, not covered in the original GPT video, but important, will cover in followup video
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        # for pn, p in self.named_parameters():
+        #     if pn.endswith('c_proj.weight'):
+        #         torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         self.pre_emb = None # cache for previous embeddings
+
+        # report number of parameters
+        print("number of parameters of EGPT: %.2fM" % (self.get_num_params()/1e6,))
 
     def _is_encoder_module(self, module):
         """Kiểm tra module có thuộc encoder không"""
@@ -492,9 +495,18 @@ class EGPT(nn.Module):
         The token embeddings would too, except due to the parameter sharing these
         params are actually used as weights in the final layer, so we include them.
         """
-        n_params = sum(p.numel() for p in self.parameters())
+        n_params = 0
+        for module in self.children():
+            if isinstance(module, Encoder):
+                # don't count the encoder parameters
+                n_params += module.get_num_params(non_embedding=non_embedding)
+            elif not self._is_encoder_module(module):
+                # count the parameters of this module only if it is not an encoder module
+                n_params += sum(p.numel() for p in module.parameters())
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            n_params -= self.position_embedding_table.weight.numel()
+            n_params -= self.length_embedding_table.weight.numel()
+            n_params -= sum(p.numel() for p in self.ffwd.parameters())
         return n_params
 
     @classmethod
@@ -522,6 +534,7 @@ class EGPT(nn.Module):
         model_args = dict(encoder_config=encoder_config, n_layer=n_layer, n_head=n_head, 
                           n_embd=n_embd, block_size=block_size,
                           bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+        encoder = Encoder.create(config.encoder_config, meta_vocab_size=meta_vocab_size)
         if init_from == 'scratch':
             # init a new model from scratch
             print("Initializing a new model from scratch")
@@ -530,22 +543,22 @@ class EGPT(nn.Module):
                 print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
             model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
             gptconf = EGPTConfig(**model_args)
-            encoder = Encoder.create(config.encoder_config, meta_vocab_size=meta_vocab_size)
             checkpoint = None
             model = cls(gptconf, encoder=encoder)
         elif init_from == 'resume':
             print(f"Resuming training from {out_dir}")
             # resume training from a checkpoint.
-            ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-            checkpoint = torch.load(ckpt_path, map_location=device)
+            ckpt_path = os.path.join(out_dir, 'last_ckpt.pt')
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
             checkpoint_model_args = checkpoint['model_args']
+            print("Checkpoint model args:", checkpoint_model_args)
             # force these config attributes to be equal otherwise we can't even resume training
             # the rest of the attributes (e.g. dropout) can stay as desired from command line
-            for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            for k in ['encoder_config', 'n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
                 model_args[k] = checkpoint_model_args[k]
             # create the model
             gptconf = EGPTConfig(**model_args)
-            model = cls(gptconf)
+            model = cls(gptconf, encoder=encoder)
             state_dict = checkpoint['model']
             # fix the keys of the state dictionary :(
             # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -559,6 +572,11 @@ class EGPT(nn.Module):
 
     @torch.no_grad()
     def encode(self, idx, targets=None):
+        if idx.shape[-1] == 0:
+            # if the input is empty, return empty embeddings
+            B = idx.shape[0]
+            C = self.config.encoder_config.n_embd
+            return torch.zeros((B, 0, C), device=idx.device), None
         return self.encoder(idx, targets)
 
     def _forward_block(self, emb, targets=None):
@@ -604,20 +622,21 @@ class EGPT(nn.Module):
         pre_emb = pre_emb[:, encoder_block_size-1::encoder_block_size, :] # (B, N - 1, C)
         if not is_init and self.pre_emb is not None:
             pre_emb = torch.cat((self.pre_emb, pre_emb), dim=-2) # (B, N - 1, C)
-        self.pre_emb = pre_emb
         B, pre_N, C = pre_emb.shape
         pre_emb = pre_emb.reshape(B, 1, pre_N, C) # (B, 1, N - 1, C)
         pre_emb = pre_emb.expand(B, T, pre_N, C) # (B, T, N - 1, C)
 
         # encode the final block
         cur_idx = idx[:, (N-1)*encoder_block_size:] # (B, T)
-        cur_emb, _ = self.encode(cur_idx) # (B, T, C)
+        cur_emb, encoder_loss = self.encode(cur_idx) # (B, T, C)
+        # print("encoder loss:", encoder_loss)
         B, T, C = cur_emb.shape
         cur_emb = cur_emb.reshape(B, T, 1, C) # (B, T, 1, C)
 
         # concatnate to get final embedding
         # pre_emb = pre_emb.expand(B, T, pre_N, C) # (B, T, N - 1, C)
         emb = torch.cat((pre_emb, cur_emb), dim=-2) # (B, T, N, C)
+        self.pre_emb = emb[:, -1, :, :].detach() # cache the current embeddings for next iteration (B,N,C)
         if targets is not None:
             targets = targets[:, -T:]
 
