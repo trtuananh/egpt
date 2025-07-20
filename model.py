@@ -454,15 +454,14 @@ class EGPT(nn.Module):
 
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = LayerNorm(config.n_embd, bias=config.bias) # final layer norm
-        self.lm_head = self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # self.lm_head.load_state_dict(self.encoder.lm_head.state_dict()) # share the lm_head with the encoder
         self.register_buffer("block_size", torch.tensor(config.block_size))
 
         # better init, not covered in the original GPT video, but important, will cover in followup video
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
-        # for pn, p in self.named_parameters():
-        #     if pn.endswith('c_proj.weight'):
-        #         torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        torch.nn.init.normal_(self.ffwd.c_proj.weight, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         self.pre_emb = None # cache for previous embeddings
 
@@ -541,7 +540,8 @@ class EGPT(nn.Module):
             # determine the vocab size we'll use for from-scratch training
             if meta_vocab_size is None:
                 print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-            model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+            # model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+            model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50257
             gptconf = EGPTConfig(**model_args)
             checkpoint = None
             model = cls(gptconf, encoder=encoder)

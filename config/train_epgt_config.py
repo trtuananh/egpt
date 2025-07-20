@@ -25,13 +25,13 @@ gradient_accumulation_steps = block_size
 # this makes total number of tokens be 300B
 resume_optimizer = True # if True, resume the optimizer state when training
 learning_rate = 6e-4 # max learning rate
-max_iters = 6000
-warmup_iters = 20 # how many steps to warm up for
-lr_decay_iters = 6000 # should be ~= max_iters per Chinchilla
+max_iters = 30000
+warmup_iters = 100 # how many steps to warm up for
+lr_decay_iters = 30000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # eval stuff
-eval_interval = 30
+eval_interval = 100
 eval_iters = 10
 log_interval = 10
 
