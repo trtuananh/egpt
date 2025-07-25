@@ -48,8 +48,8 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from config import train_epgt_long as config
-from config.train_epgt_long import *
+from config import train_epgt_long_colab as config
+from config.train_epgt_long_colab import *
 
 from checkpoint import save_checkpoint, load_checkpoint
 from model import GPTConfig, GPT, EGPTConfig, EGPT, Encoder

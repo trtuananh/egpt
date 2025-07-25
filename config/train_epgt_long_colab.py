@@ -1,5 +1,5 @@
 import os
-from .base_config import *
+from .train_colab import *
 from . import eval_gpt2 as encoder_config
 
 # -----------------------------------------------------------------------------
@@ -20,7 +20,7 @@ wandb_run_name='egpt-long'
 
 n_layer = 3
 n_head = 12
-batch_size = 2
+batch_size = 4
 block_size = 16
 gradient_accumulation_steps = block_size
 
@@ -34,7 +34,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 
 # eval stuff
 eval_interval = 50
-eval_iters = 10
+eval_iters = 1
 log_interval = 10
 
 # weight decay
