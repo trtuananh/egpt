@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from checkpoint import load_checkpoint
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -549,7 +550,8 @@ class EGPT(nn.Module):
             print(f"Resuming training from {out_dir}")
             # resume training from a checkpoint.
             ckpt_path = os.path.join(out_dir, 'last_ckpt.pt')
-            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+            # checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+            checkpoint = load_checkpoint(ckpt_path, device=device)
             checkpoint_model_args = checkpoint['model_args']
             print("Checkpoint model args:", checkpoint_model_args)
             # force these config attributes to be equal otherwise we can't even resume training

@@ -9,7 +9,7 @@ from datasets import load_dataset # huggingface datasets
 
 # number of workers in .map() call
 # good number to use is ~order number of cpu cores // 2
-num_proc = 8
+num_proc = 4
 
 # number of workers in load_dataset() call
 # best number might be different from num_proc above as it also depends on NW speed.
@@ -58,6 +58,28 @@ if __name__ == '__main__':
         desc="tokenizing the splits",
         num_proc=num_proc,
     )
+
+    import matplotlib.pyplot as plt
+
+    # Lấy độ dài của tất cả các sample trong tập train
+    lengths = tokenized['train']['len']
+
+    # Vẽ histogram
+    plt.figure(figsize=(10, 6))
+    plt.hist(lengths, bins=100, range=(0, 4096), log=True) # Dùng log scale cho trục y để dễ nhìn
+    plt.title('Phân bố độ dài Token trong OpenWebText (Train Split)')
+    plt.xlabel('Độ dài Token')
+    plt.ylabel('Số lượng (log scale)')
+    plt.show()
+
+    # In ra một vài thống kê cơ bản
+    import numpy as np
+    print(f"Tổng số sample: {len(lengths)}")
+    print(f"Độ dài trung bình: {np.mean(lengths):.2f}")
+    print(f"Độ dài trung vị: {np.median(lengths)}")
+    print(f"Độ dài tối đa: {np.max(lengths)}")
+    print(f"Số sample có độ dài > 1024: {np.sum(np.array(lengths) > 1024)}")
+    print(f"Số sample có độ dài > 16384: {np.sum(np.array(lengths) > 16384)}")
 
     # concatenate all the ids in each dataset into one large file we can use for training
     for split, dset in tokenized.items():

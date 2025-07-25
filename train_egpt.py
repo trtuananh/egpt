@@ -15,6 +15,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
+import os
 import ctypes
 import atexit
 
@@ -24,18 +25,20 @@ ES_SYSTEM_REQUIRED = 0x00000001
 ES_AWAYMODE_REQUIRED = 0x00000040  # Optional, useful for media apps
 
 def prevent_sleep():
+    if os.name != 'nt':
+        return
     ctypes.windll.kernel32.SetThreadExecutionState(
         ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
     )
 
 def allow_sleep():
+    if os.name != 'nt':
+        return
     ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
 # Đảm bảo máy không sleep trong quá trình chạy
 prevent_sleep()
 
-
-import os
 import time
 import math
 import pickle
@@ -45,10 +48,12 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from config import train_epgt_1n as config
-from config.train_epgt_1n import *
+from config import train_epgt_long as config
+from config.train_epgt_long import *
 
+from checkpoint import save_checkpoint, load_checkpoint
 from model import GPTConfig, GPT, EGPTConfig, EGPT, Encoder
+from data.openwebtext_long.prepare import get_batch
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -88,22 +93,6 @@ data_dir = os.path.join('data', dataset)
 encoder_block_size = encoder_config.block_size
 context_size = block_size * encoder_block_size
 print(f"Using context size: {context_size} (block size: {block_size}, encoder block size: {encoder_block_size})")
-def get_batch(split, block_size=context_size):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -151,7 +140,8 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters*block_size, device=device)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y = get_batch(split, block_size=context_size, batch_size=batch_size, device=device, device_type=device_type)
+            # print("X shape:", X.shape, "Y shape:", Y.shape)
             for block_idx in range(block_size):
                 with ctx:
                     block_X = X[:, block_idx * encoder_block_size:(block_idx + 1) * encoder_block_size]
@@ -218,13 +208,15 @@ while True:
         }
         if is_best:
             best_val_loss = losses['val']
-            print(f"saving best checkpoint to {out_dir}, best_val_loss = {best_val_loss:.4f}")
-            torch.save(checkpoint, os.path.join(out_dir, 'best_ckpt.pt'))
+            save_checkpoint(os.path.join(out_dir, 'best_ckpt.pt'), 
+                            raw_model, optimizer, model_args, 
+                            iter_num, best_val_loss, config.config_dict)
             
         if iter_num > 0 and always_save_checkpoint:
             # save a checkpoint every eval_interval iterations
-            print(f"saving last checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, f'last_ckpt.pt'))
+            save_checkpoint(os.path.join(out_dir, 'last_ckpt.pt'), 
+                            raw_model, optimizer, model_args,
+                            iter_num, best_val_loss, config.config_dict)
 
     if iter_num == 0 and eval_only:
         break
@@ -234,7 +226,7 @@ while True:
     for micro_step in range(gradient_accumulation_steps):
         block_idx = micro_step % block_size
         if block_idx == 0:
-            X, Y = get_batch('train')
+            X, Y = get_batch('train', block_size=context_size, batch_size=batch_size, device=device, device_type=device_type)
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
             # the official way to do this is with model.no_sync() context manager, but
