@@ -53,7 +53,6 @@ from config.train_epgt_long import *
 
 from checkpoint import save_checkpoint, load_checkpoint
 from model import GPTConfig, GPT, EGPTConfig, EGPT, Encoder
-from data.openwebtext_long.prepare import get_batch
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -89,7 +88,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+data_dir = os.path.join(data_dir, dataset)
 encoder_block_size = encoder_config.block_size
 context_size = block_size * encoder_block_size
 print(f"Using context size: {context_size} (block size: {block_size}, encoder block size: {encoder_block_size})")
@@ -131,6 +130,44 @@ if compile and os.name != 'nt' and torch.__version__ >= '2.0':
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+
+def get_batch(split, block_size=1024, batch_size=32, device='cpu', device_type='cpu'):
+    # Load metadata and data
+    meta = np.load(os.path.join(data_dir, f'{split}_meta.npy'), allow_pickle=True).item()
+    data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
+    
+    # Randomly select rows
+    row_indices = np.random.randint(0, len(meta['start_positions']), batch_size)
+    
+    x = []
+    y = []
+    for idx in row_indices:
+        start_pos = meta['start_positions'][idx]
+        row_length = meta['lengths'][idx]
+        
+        # Ensure block fits within row (excluding EOT token)
+        max_start = row_length - block_size - 1
+        if max_start <= 0:
+            continue  # Skip rows that are too short
+        block_start = start_pos + np.random.randint(0, max_start)
+        
+        # Extract block
+        x_block = torch.from_numpy(data[block_start:block_start + block_size].astype(np.int64))
+        y_block = torch.from_numpy(data[block_start + 1:block_start + 1 + block_size].astype(np.int64))
+        # print("Row length:", row_length, "Block start:", block_start, "X size:", x_block.shape, "Y size:", y_block.shape)
+        
+        x.append(x_block)
+        y.append(y_block)
+    
+    x = torch.stack(x)
+    y = torch.stack(y)
+    
+    if device_type == 'cuda':
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
+    
+    return x, y
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -208,13 +245,13 @@ while True:
         }
         if is_best:
             best_val_loss = losses['val']
-            save_checkpoint(os.path.join(out_dir, 'best_ckpt.pt'), 
+            save_checkpoint(os.path.join(out_dir, name, 'best_ckpt.pt'), 
                             raw_model, optimizer, model_args, 
                             iter_num, best_val_loss, config.config_dict)
             
         if iter_num > 0 and always_save_checkpoint:
             # save a checkpoint every eval_interval iterations
-            save_checkpoint(os.path.join(out_dir, 'last_ckpt.pt'), 
+            save_checkpoint(os.path.join(out_dir, name, 'last_ckpt.pt'), 
                             raw_model, optimizer, model_args,
                             iter_num, best_val_loss, config.config_dict)
 

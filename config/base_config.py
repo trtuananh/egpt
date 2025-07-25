@@ -3,6 +3,7 @@ import torch
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+name = 'gpt2' # name of the model, used for saving checkpoints
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
@@ -15,6 +16,7 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
+data_dir = 'data' # directory where the dataset is stored
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
