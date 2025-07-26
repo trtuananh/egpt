@@ -37,7 +37,7 @@ def load_checkpoint(path, model=None, optimizer=None, device='cpu', weights_only
         optimizer.load_state_dict(checkpoint['optimizer'])
 
     torch.set_rng_state(checkpoint['rng_state'].cpu())
-    if torch.cuda.is_available() and checkpoint['cuda_rng_state']:
+    if torch.cuda.is_available() and checkpoint['cuda_rng_state'] is not None:
         torch.cuda.set_rng_state(checkpoint['cuda_rng_state'].cpu())
 
     print(f"Checkpoint loaded from {path}. Resuming from Step {checkpoint['iter_num']}.")
