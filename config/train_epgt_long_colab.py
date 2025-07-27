@@ -10,7 +10,6 @@ from . import eval_gpt2 as encoder_config
 name = 'egpt_long' # name of the model, used for saving checkpoints
 dataset = 'openwebtext_long' # use the smaller openwebtext dataset for faster training
 init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
-# out_dir = os.path.join('out', 'epgt_long')
 wandb_log = True
 wandb_project = 'owt'
 wandb_run_name='egpt-long'
