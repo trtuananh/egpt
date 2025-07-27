@@ -290,7 +290,10 @@ class GPT(nn.Module):
             ckpt_dir = os.path.join(out_dir, name)
             print(f"Resuming training from {ckpt_dir}")
             # resume training from a checkpoint.
-            ckpt_path = os.path.join(ckpt_dir, 'ckpt.pt')
+            if config.eval_only:
+                ckpt_path = os.path.join(ckpt_dir, 'best_ckpt.pt')
+            else:
+                ckpt_path = os.path.join(ckpt_dir, 'last_ckpt.pt')
             checkpoint = torch.load(ckpt_path, map_location=device)
             checkpoint_model_args = checkpoint['model_args']
             # force these config attributes to be equal otherwise we can't even resume training
@@ -553,7 +556,10 @@ class EGPT(nn.Module):
             ckpt_dir = os.path.join(out_dir, name)
             print(f"Resuming training from {ckpt_dir}")
             # resume training from a checkpoint.
-            ckpt_path = os.path.join(ckpt_dir, 'last_ckpt.pt')
+            if config.eval_only:
+                ckpt_path = os.path.join(ckpt_dir, 'best_ckpt.pt')
+            else:
+                ckpt_path = os.path.join(ckpt_dir, 'last_ckpt.pt')
             # checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
             checkpoint = load_checkpoint(ckpt_path, device=device)
             checkpoint_model_args = checkpoint['model_args']

@@ -16,29 +16,6 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 import os
-import ctypes
-import atexit
-
-# Set thread execution state to prevent system from sleeping
-ES_CONTINUOUS = 0x80000000
-ES_SYSTEM_REQUIRED = 0x00000001
-ES_AWAYMODE_REQUIRED = 0x00000040  # Optional, useful for media apps
-
-def prevent_sleep():
-    if os.name != 'nt':
-        return
-    ctypes.windll.kernel32.SetThreadExecutionState(
-        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
-    )
-
-def allow_sleep():
-    if os.name != 'nt':
-        return
-    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-
-# Đảm bảo máy không sleep trong quá trình chạy
-prevent_sleep()
-
 import time
 import math
 import pickle
@@ -50,9 +27,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from config import train_epgt_long_colab as config
 from config.train_epgt_long_colab import *
+from waking import prevent_sleep
 
 from checkpoint import save_checkpoint, load_checkpoint
 from model import GPTConfig, GPT, EGPTConfig, EGPT, Encoder
+
+# Đảm bảo máy không sleep trong quá trình chạy
+prevent_sleep()
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -185,6 +166,10 @@ def estimate_loss():
                     block_Y = Y[:, block_idx * encoder_block_size:(block_idx + 1) * encoder_block_size]
                     _, loss = model(block_X, targets=block_Y, is_init=block_idx == 0)
                     losses[k * block_size + block_idx] = loss.item()
+
+            if k % log_interval == 0 and master_process:
+                print(f"Evaluating {split} loss: iter {k}/{eval_iters}, loss {loss:.4f}")
+        assert all(losses > 0), "Losses should be not zero"
         out[split] = losses.mean()
     model.train()
     return out
@@ -255,7 +240,7 @@ while True:
                             raw_model, optimizer, model_args,
                             iter_num, best_val_loss, config.config_dict)
 
-    if iter_num == 0 and eval_only:
+    if eval_only:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
@@ -308,7 +293,3 @@ while True:
 
 if ddp:
     destroy_process_group()
-
-
-# Khi chương trình kết thúc, cho phép sleep lại
-atexit.register(allow_sleep)

@@ -1,5 +1,5 @@
 import os
-from .train_colab import *
+from .base_config import *
 from . import eval_gpt2 as encoder_config
 
 # -----------------------------------------------------------------------------
@@ -10,10 +10,6 @@ from . import eval_gpt2 as encoder_config
 name = 'egpt_long' # name of the model, used for saving checkpoints
 dataset = 'openwebtext_long' # use the smaller openwebtext dataset for faster training
 init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
-# out_dir = os.path.join('out', 'epgt_long')
-wandb_log = True
-wandb_project = 'owt'
-wandb_run_name='egpt-long'
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
@@ -34,13 +30,12 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 
 # eval stuff
 eval_interval = 50
-eval_iters = 10
+eval_iters = 50
+eval_only = True
 log_interval = 10
 
 # weight decay
 weight_decay = 1e-1
-compile = False # use PyTorch 2.0 to compile the model to be faster
-
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]

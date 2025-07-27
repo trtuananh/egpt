@@ -34,7 +34,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 
 # eval stuff
 eval_interval = 50
-eval_iters = 10
+eval_iters = 1
 log_interval = 10
 
 # weight decay
