@@ -20,7 +20,7 @@ wandb_run_name='egpt-long'
 
 n_layer = 3
 n_head = 12
-batch_size = 8
+batch_size = 12
 block_size = 2
 gradient_accumulation_steps = block_size
 
