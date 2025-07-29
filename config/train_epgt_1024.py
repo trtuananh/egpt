@@ -1,5 +1,5 @@
 import os
-from .base_config import *
+from .train_colab import *
 from . import eval_gpt2 as encoder_config
 
 # -----------------------------------------------------------------------------
@@ -20,7 +20,7 @@ wandb_run_name='egpt-long'
 
 n_layer = 3
 n_head = 12
-batch_size = 4
+batch_size = 8
 block_size = 2
 gradient_accumulation_steps = block_size
 
