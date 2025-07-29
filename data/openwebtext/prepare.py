@@ -64,6 +64,16 @@ if __name__ == '__main__':
     # Lấy độ dài của tất cả các sample trong tập train
     lengths = tokenized['train']['len']
 
+    # In ra một vài thống kê cơ bản
+    import numpy as np
+    print(f"Tổng số sample: train {len(lengths)}, val {len(tokenized['val']['len'])}")
+    print(f"Tổng số token: train {np.sum(lengths)}, val {np.sum(tokenized['val']['len'])}")
+    print(f"Độ dài trung bình: {np.mean(lengths):.2f}")
+    print(f"Độ dài trung vị: {np.percentile(lengths, 25)}, {np.median(lengths)}, {np.percentile(lengths, 75)}")
+    print(f"Độ dài tối đa: {np.max(lengths)}")
+    print(f"Số sample có độ dài > 1024: {np.sum(np.array(lengths) > 1024)}")
+    print(f"Số sample có độ dài > 16384: {np.sum(np.array(lengths) > 16384)}")
+
     # Vẽ histogram
     plt.figure(figsize=(10, 6))
     plt.hist(lengths, bins=100, range=(0, 4096), log=True) # Dùng log scale cho trục y để dễ nhìn
@@ -72,36 +82,27 @@ if __name__ == '__main__':
     plt.ylabel('Số lượng (log scale)')
     plt.show()
 
-    # In ra một vài thống kê cơ bản
-    import numpy as np
-    print(f"Tổng số sample: {len(lengths)}")
-    print(f"Độ dài trung bình: {np.mean(lengths):.2f}")
-    print(f"Độ dài trung vị: {np.median(lengths)}")
-    print(f"Độ dài tối đa: {np.max(lengths)}")
-    print(f"Số sample có độ dài > 1024: {np.sum(np.array(lengths) > 1024)}")
-    print(f"Số sample có độ dài > 16384: {np.sum(np.array(lengths) > 16384)}")
-
     # concatenate all the ids in each dataset into one large file we can use for training
-    for split, dset in tokenized.items():
-        arr_len = np.sum(dset['len'], dtype=np.uint64)
-        filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
-        dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
-        arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
+    # for split, dset in tokenized.items():
+    #     arr_len = np.sum(dset['len'], dtype=np.uint64)
+    #     filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
+    #     dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
+    #     arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
         
-        # Calculate number of batches based on dataset size
-        # Use smaller number of batches for small datasets
-        num_samples = len(dset)
-        total_batches = min(1024, num_samples)  # cap at 1024, but use fewer for smaller datasets
+    #     # Calculate number of batches based on dataset size
+    #     # Use smaller number of batches for small datasets
+    #     num_samples = len(dset)
+    #     total_batches = min(1024, num_samples)  # cap at 1024, but use fewer for smaller datasets
 
-        idx = 0
-        for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
-            # Batch together samples for faster write
-            batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
-            arr_batch = np.concatenate(batch['ids'])
-            # Write into mmap
-            arr[idx : idx + len(arr_batch)] = arr_batch
-            idx += len(arr_batch)
-        arr.flush()
+    #     idx = 0
+    #     for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
+    #         # Batch together samples for faster write
+    #         batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
+    #         arr_batch = np.concatenate(batch['ids'])
+    #         # Write into mmap
+    #         arr[idx : idx + len(arr_batch)] = arr_batch
+    #         idx += len(arr_batch)
+    #     arr.flush()
 
     # train.bin is ~17GB, val.bin ~8.5MB
     # train has ~9B tokens (9,035,582,198)

@@ -59,6 +59,27 @@ if __name__ == '__main__':
         num_proc=num_proc,
     )
 
+    
+    import matplotlib.pyplot as plt
+    
+    # Plot histogram of lengths for train split
+    lengths = tokenized['train']['len']
+    
+    # Print statistics
+    print(f"Tổng số sample (train): {len(lengths)}")
+    print(f"Độ dài trung bình (train): {np.mean(lengths):.2f}")
+    print(f"Độ dài trung vị (train): {np.median(lengths)}")
+    print(f"Độ dài tối thiểu (train): {np.min(lengths)}")
+    print(f"Độ dài tối đa (train): {np.max(lengths)}")
+    print(f"Tổng số sample (val): {len(tokenized['val']['len'])}")
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(lengths, bins=100, log=True)
+    plt.title('Phân bố độ dài Token trong OpenWebText (Train Split, >16384 tokens)')
+    plt.xlabel('Độ dài Token')
+    plt.ylabel('Số lượng (log scale)')
+    plt.show()
+
     # concatenate all the ids in each dataset into one large file we can use for training
     for split, dset in tokenized.items():
         arr_len = np.sum(dset['len'], dtype=np.uint64)

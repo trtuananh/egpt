@@ -25,8 +25,8 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from config import train_epgt_long_colab as config
-from config.train_epgt_long_colab import *
+from config import train_epgt_1024 as config
+from config.train_epgt_1024 import *
 from waking import prevent_sleep
 
 from checkpoint import save_checkpoint, load_checkpoint
@@ -112,7 +112,7 @@ if compile and os.name != 'nt' and torch.__version__ >= '2.0':
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
-def get_batch(split, block_size=1024, batch_size=32, device='cpu', device_type='cpu'):
+def get_continuous_batch(split, block_size=1024, batch_size=32, device='cpu', device_type='cpu'):
     # Load metadata and data
     meta = np.load(os.path.join(data_dir, f'{split}_meta.npy'), allow_pickle=True).item()
     data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
@@ -148,6 +148,23 @@ def get_batch(split, block_size=1024, batch_size=32, device='cpu', device_type='
     else:
         x, y = x.to(device), y.to(device)
     
+    return x, y
+
+def get_batch(split, block_size, batch_size, device='cpu', device_type='cpu'):
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    if device_type == 'cuda':
+        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
     return x, y
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
