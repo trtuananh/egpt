@@ -20,7 +20,7 @@ wandb_run_name='egpt-long'
 
 n_layer = 3
 n_head = 12
-batch_size = 14
+batch_size = 12
 block_size = 2
 gradient_accumulation_steps = block_size
 
@@ -34,7 +34,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 
 # eval stuff
 eval_interval = 500
-eval_iters = 1
+eval_iters = 100
 log_interval = 100
 
 # weight decay
