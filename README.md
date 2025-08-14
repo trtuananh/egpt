@@ -2,7 +2,7 @@
 
 ## Overview
 
-EGPT (Encoder GPT) is a novel architecture that extends the context length of traditional transformer models by leveraging a pre-trained encoder (such as GPT-2) to extract features from input sequences. This approach enables exponential scaling of context window size while maintaining computational efficiency.
+EGPT (Encoder-Enhanced GPT) is a novel architecture that extends the context length of traditional transformer models by leveraging a pre-trained encoder (such as GPT-2) to extract features from input sequences. This approach enables exponential scaling of context window size while maintaining computational efficiency.
 
 ## Architecture
 
@@ -202,3 +202,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
