@@ -696,3 +696,246 @@ class EGPT(nn.Module):
         flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
+
+
+# DeepGPT Language Model
+class DeepGPTConfig(tp.NamedTuple):
+    encoder_config: GPTConfig = GPTConfig()
+    block_size: int = 1024
+    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+class DeepGPT(nn.Module):
+    """
+    Baseline model that uses a frozen Encoder (GPT-based) to get initial embeddings,
+    then continues forwarding through additional standard transformer blocks.
+    This effectively deepens the transformer without extending the context window beyond the encoder's block_size.
+    """
+
+    def __init__(self, config: DeepGPTConfig, encoder: Encoder = None):
+        super().__init__()
+        self.config = config
+        if encoder is None:
+            self.encoder = Encoder(config=config.encoder_config)
+        else:
+            self.encoder = encoder
+        self.encoder.eval()
+        # Freeze encoder parameters
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = LayerNorm(config.n_embd, bias=config.bias)  # final layer norm
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # better init, not covered in the original GPT video, but important, will cover in followup video
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+
+        # report number of parameters
+        print("number of parameters of DeepGPT: %.2fM" % (self.get_num_params() / 1e6,))
+
+    def _is_encoder_module(self, module):
+        """Check if module belongs to encoder"""
+        for encoder_module in self.encoder.modules():
+            if module is encoder_module:
+                return True
+        return False
+
+    def _init_weights(self, module):
+        # Skip encoder modules
+        if self._is_encoder_module(module):
+            return
+
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model, excluding the frozen encoder.
+        """
+        n_params = 0
+        for module in self.children():
+            if isinstance(module, Encoder):
+                continue  # don't count the encoder parameters
+            elif not self._is_encoder_module(module):
+                # count the parameters of this module only if it is not an encoder module
+                n_params += sum(p.numel() for p in module.parameters())
+        return n_params
+
+    @torch.no_grad()
+    def encode(self, idx, targets=None):
+        if idx.shape[-1] == 0:
+            # if the input is empty, return empty embeddings
+            B = idx.shape[0]
+            C = self.config.encoder_config.n_embd
+            return torch.zeros((B, 0, C), device=idx.device), None
+        return self.encoder(idx, targets)
+
+    def forward(self, idx, targets=None):
+        # Get embeddings from the frozen encoder
+        emb, encoder_loss = self.encode(idx, targets)  # (B, T, C)
+
+        # Continue forwarding through additional transformer blocks
+        x = emb
+        for block in self.blocks:
+            x = block(x)
+
+        # Final layer norm and lm head
+        x = self.ln_f(x)
+
+        if targets is not None:
+            # If we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # Inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return logits, loss
+
+    @classmethod
+    def create(cls, config, meta_vocab_size=None):
+        print("================ Creating DeepGPT model ================")
+        name = config.name
+        out_dir = config.out_dir
+        init_from = config.init_from
+        n_layer = config.n_layer
+        n_head = config.n_head
+        n_embd = config.n_embd
+        block_size = config.block_size
+        dropout = config.dropout
+        bias = config.bias
+        device = config.device
+        encoder_config = GPTConfig(
+            block_size=config.encoder_config.block_size,
+            n_layer=config.encoder_config.n_layer,
+            n_head=config.encoder_config.n_head,
+            n_embd=config.encoder_config.n_embd,
+            dropout=config.encoder_config.dropout,
+            bias=config.encoder_config.bias
+        )
+
+        model_args = dict(encoder_config=encoder_config, n_layer=n_layer, n_head=n_head,
+                          n_embd=n_embd, block_size=block_size,
+                          bias=bias, vocab_size=None, dropout=dropout)  # start with model_args from command line
+        encoder = Encoder.create(config.encoder_config, meta_vocab_size=meta_vocab_size)
+        if init_from == 'scratch':
+            # init a new model from scratch
+            print("Initializing a new model from scratch")
+            # determine the vocab size we'll use for from-scratch training
+            if meta_vocab_size is None:
+                print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+            model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50257
+            gptconf = DeepGPTConfig(**model_args)
+            checkpoint = None
+            model = cls(gptconf, encoder=encoder)
+        elif init_from == 'resume':
+            ckpt_dir = os.path.join(out_dir, name)
+            print(f"Resuming training from {ckpt_dir}")
+            # resume training from a checkpoint.
+            if config.eval_only:
+                ckpt_path = os.path.join(ckpt_dir, 'best_ckpt.pt')
+            else:
+                ckpt_path = os.path.join(ckpt_dir, 'last_ckpt.pt')
+            checkpoint = load_checkpoint(ckpt_path, device=device)
+            checkpoint_model_args = checkpoint['model_args']
+            print("Checkpoint model args:", checkpoint_model_args)
+            # force these config attributes to be equal otherwise we can't even resume training
+            # the rest of the attributes (e.g. dropout) can stay as desired from command line
+            for k in ['encoder_config', 'n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+                model_args[k] = checkpoint_model_args[k]
+            # create the model
+            gptconf = DeepGPTConfig(**model_args)
+            model = cls(gptconf, encoder=encoder)
+            state_dict = checkpoint['model']
+            # fix the keys of the state dictionary :(
+            # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+            unwanted_prefix = '_orig_mod.'
+            for k, v in list(state_dict.items()):
+                if k.startswith(unwanted_prefix):
+                    state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+            model.load_state_dict(state_dict)
+        model.to(device)
+        return model, checkpoint, model_args
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd // cfg.n_head, cfg.block_size
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = flops_achieved / flops_promised
+        return mfu
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx

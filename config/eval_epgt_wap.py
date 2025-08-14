@@ -7,16 +7,20 @@ from . import eval_gpt2 as encoder_config
 # launch as the following (e.g. in a screen session) and wait ~5 days:
 # $ torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
 
-name = 'egpt_long' # name of the model, used for saving checkpoints
-dataset = 'openwebtext_long' # use the smaller openwebtext dataset for faster training
+name = 'egpt_wap' # name of the model, used for saving checkpoints
+dataset = 'war_and_peace' # use the smaller openwebtext dataset for faster training
 init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
+# out_dir = os.path.join('out', 'epgt_long')
+wandb_log = True
+wandb_project = 'owt'
+wandb_run_name='egpt-long'
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
 
 n_layer = 3
 n_head = 12
-batch_size = 4
+batch_size = 2
 block_size = 16
 gradient_accumulation_steps = block_size
 
@@ -29,9 +33,9 @@ lr_decay_iters = 6000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # eval stuff
-eval_interval = 50
-eval_iters = 50
 eval_only = True
+eval_interval = 50
+eval_iters = 10
 log_interval = 1
 
 # weight decay

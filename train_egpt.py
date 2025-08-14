@@ -25,8 +25,8 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from config import train_epgt_1024 as config
-from config.train_epgt_1024 import *
+from config import eval_epgt_wap as config
+from config.eval_epgt_wap import *
 from waking import prevent_sleep
 
 from checkpoint import save_checkpoint, load_checkpoint
@@ -251,7 +251,7 @@ while True:
                             raw_model, optimizer, model_args, 
                             iter_num, best_val_loss, config.config_dict)
             
-        if iter_num > 0 and always_save_checkpoint:
+        if not eval_only and iter_num > 0 and always_save_checkpoint:
             # save a checkpoint every eval_interval iterations
             save_checkpoint(os.path.join(out_dir, name, 'last_ckpt.pt'), 
                             raw_model, optimizer, model_args,

@@ -13,7 +13,7 @@ def prevent_sleep():
         return
     print("Preventing system sleep...")
     ctypes.windll.kernel32.SetThreadExecutionState(
-        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED | ES_DISPLAY_REQUIRED
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED | ES_DISPLAY_REQUIRED 
     )
     atexit.register(allow_sleep)
 
