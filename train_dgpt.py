@@ -25,8 +25,8 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from config import eval_dpgt_wap as config  # Adjust config import as needed for DeepGPT
-from config.eval_dpgt_wap import *
+from config import train_dpgt_tolstoy as config  # Adjust config import as needed for DeepGPT
+from config.train_dpgt_tolstoy import *
 from waking import prevent_sleep
 
 from checkpoint import save_checkpoint, load_checkpoint
